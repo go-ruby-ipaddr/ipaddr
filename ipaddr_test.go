@@ -401,6 +401,34 @@ func TestHtonAndNtop(t *testing.T) {
 	if _, err := NewNtoh([]byte{1}); err == nil {
 		t.Error("new_ntoh bad len want err")
 	}
+
+	// NtopString mirrors MRI's IPAddr.ntop encoding precedence: the encoding is
+	// checked before the length. A BINARY/ASCII-8BIT string dispatches on length
+	// (4 -> IPv4, 16 -> IPv6, else AddressFamilyError); any other encoding raises
+	// InvalidAddressError first — even when the length is valid.
+	for _, enc := range []string{"ASCII-8BIT", "BINARY"} {
+		if s, err := NtopString("\x01\x02\x03\x04", enc); err != nil || s != "1.2.3.4" {
+			t.Errorf("NtopString v4 (%s) = %q %v", enc, s, err)
+		}
+		if s, err := NtopString(string(v6), enc); err != nil || s != "0000:0000:0000:0000:0000:0000:0000:0001" {
+			t.Errorf("NtopString v6 (%s) = %q %v", enc, s, err)
+		}
+		// Bad length under a BINARY encoding -> AddressFamilyError, like Ntop.
+		if _, err := NtopString("xy", enc); !errors.As(err, new(*AddressFamilyError)) {
+			t.Errorf("NtopString bad len (%s) err = %v", enc, err)
+		}
+	}
+	// MRI 4.0.5: IPAddr.ntop("xy") (UTF-8) -> InvalidAddressError, NOT
+	// AddressFamilyError, because the encoding check precedes the length check.
+	if _, err := NtopString("xy", "UTF-8"); !errors.As(err, new(*InvalidAddressError)) {
+		t.Errorf("NtopString bad encoding err = %v", err)
+	} else if want := "invalid encoding (given UTF-8, expected BINARY)"; err.Error() != want {
+		t.Errorf("NtopString bad encoding msg = %q, want %q", err.Error(), want)
+	}
+	// Non-binary encoding is rejected even at a valid 4-byte length.
+	if _, err := NtopString("\x01\x02\x03\x04", "US-ASCII"); !errors.As(err, new(*InvalidAddressError)) {
+		t.Errorf("NtopString valid-len non-binary err = %v", err)
+	}
 }
 
 func TestNewFromIntAndFamily(t *testing.T) {
