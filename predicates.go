@@ -135,7 +135,9 @@ func (ip *IPAddr) Native() (*IPAddr, error) {
 }
 
 // Ntop converts a packed network-byte-ordered address (4 or 16 bytes) to its
-// readable form, mirroring IPAddr.ntop.
+// readable form, mirroring IPAddr.ntop. A []byte carries no Ruby encoding, so it
+// is treated as BINARY (Encoding::ASCII_8BIT): a length other than 4 or 16 raises
+// AddressFamilyError, exactly as MRI does for a BINARY-encoded String.
 func Ntop(addr []byte) (string, error) {
 	switch len(addr) {
 	case 4:
@@ -149,6 +151,23 @@ func Ntop(addr []byte) (string, error) {
 	default:
 		return "", &AddressFamilyError{"unsupported address family"}
 	}
+}
+
+// NtopString mirrors IPAddr.ntop for a Ruby String argument, honouring MRI's
+// encoding precedence: the encoding is checked *before* the byte length.
+//
+// MRI raises InvalidAddressError "invalid encoding (given <enc>, expected BINARY)"
+// for any String whose encoding is not Encoding::ASCII_8BIT/BINARY — and it does
+// so even when the length would otherwise be valid (e.g. a 4-byte US-ASCII
+// string). Only once the encoding is BINARY does it dispatch on length, raising
+// AddressFamilyError for a length other than 4 or 16. encoding is the Ruby
+// encoding name of s (e.g. "UTF-8", "US-ASCII", "ASCII-8BIT", "BINARY"); the
+// canonical BINARY aliases are "ASCII-8BIT" and "BINARY".
+func NtopString(s, encoding string) (string, error) {
+	if encoding != "ASCII-8BIT" && encoding != "BINARY" {
+		return "", &InvalidAddressError{"invalid encoding (given " + encoding + ", expected BINARY)"}
+	}
+	return Ntop([]byte(s))
 }
 
 // NewNtoh builds an IPAddr from a packed network-byte-ordered address, mirroring

@@ -192,6 +192,61 @@ func TestOracleErrors(t *testing.T) {
 	}
 }
 
+// TestOracleNtop checks IPAddr.ntop against MRI for the success paths and for
+// the two distinct failure modes whose precedence the port must preserve: a
+// non-BINARY encoding (InvalidAddressError, checked first) versus a bad length
+// under BINARY (AddressFamilyError).
+func TestOracleNtop(t *testing.T) {
+	bin := rubyBin(t)
+
+	type ntCase struct {
+		bytes string // raw bytes of the argument
+		enc   string // Ruby encoding name
+	}
+	cases := []ntCase{
+		{"\x01\x02\x03\x04", "ASCII-8BIT"}, // 4 bytes BINARY -> IPv4
+		{"\x20\x01\x0d\xb8\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x01", "ASCII-8BIT"}, // 16 bytes BINARY -> IPv6
+		{"xy", "ASCII-8BIT"},             // bad length BINARY -> AddressFamilyError
+		{"xy", "UTF-8"},                  // non-BINARY -> InvalidAddressError (precedence)
+		{"\x01\x02\x03\x04", "US-ASCII"}, // valid length but non-BINARY -> InvalidAddressError
+	}
+	for _, c := range cases {
+		got := ntopResult(NtopString(c.bytes, c.enc))
+		// Build the Ruby argument with the requested encoding, byte-for-byte.
+		var rb strings.Builder
+		rb.WriteByte('"')
+		for i := 0; i < len(c.bytes); i++ {
+			rb.WriteString("\\x")
+			rb.WriteString(hexByte(c.bytes[i]))
+		}
+		rb.WriteString("\".dup.force_encoding(")
+		rb.WriteString(rbStr(c.enc))
+		rb.WriteByte(')')
+		script := "arg = " + rb.String() + "\n" +
+			"begin; print IPAddr.ntop(arg); rescue => e; print \"#{e.class}: #{e.message}\"; end"
+		want := rubyEval(t, bin, script)
+		if got != want {
+			t.Errorf("ntop(%q, %s):\n  go   = %q\n  ruby = %q", c.bytes, c.enc, got, want)
+		}
+	}
+}
+
+// ntopResult renders an NtopString result the same way the Ruby script prints it:
+// the readable address on success, or "<class>: <message>" on failure.
+func ntopResult(s string, err error) string {
+	if err == nil {
+		return s
+	}
+	return errClass(err) + ": " + err.Error()
+}
+
+// hexByte renders b as a two-digit lowercase hex string.
+func hexByte(b byte) string {
+	const hexdigits = "0123456789abcdef"
+	return string([]byte{hexdigits[b>>4], hexdigits[b&0xf]})
+}
+
 // errClass renders the IPAddr:: error class name MRI would report.
 func errClass(err error) string {
 	switch err.(type) {
