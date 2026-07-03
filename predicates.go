@@ -4,27 +4,47 @@
 
 package ipaddr
 
-import (
-	"fmt"
-	"math/big"
+// Predicate bit-test constants (mask, value) as fixed-width native values,
+// mirroring MRI's IN*MASK-style comparisons.
+var (
+	v4LoopMask  = hexU128("ff000000")
+	v4LoopVal   = hexU128("7f000000")
+	v4Priv10M   = hexU128("ff000000")
+	v4Priv10V   = hexU128("0a000000")
+	v4Priv172M  = hexU128("fff00000")
+	v4Priv172V  = hexU128("ac100000")
+	v4Priv192M  = hexU128("ffff0000")
+	v4Priv192V  = hexU128("c0a80000")
+	v4LinkMask  = hexU128("ffff0000")
+	v4LinkVal   = hexU128("a9fe0000")
+	v4McastMask = hexU128("f0000000")
+	v4McastVal  = hexU128("e0000000")
+
+	v6MappedMask = hexU128("ffff00000000")
+	v6MappedVal  = hexU128("ffff00000000")
+	v6UlaMask    = hexU128("fe000000000000000000000000000000")
+	v6UlaVal     = hexU128("fc000000000000000000000000000000")
+	v6LinkMask   = hexU128("ffc00000000000000000000000000000")
+	v6LinkVal    = hexU128("fe800000000000000000000000000000")
+	v6McastMask  = hexU128("ff000000000000000000000000000000")
+	v6McastVal   = hexU128("ff000000000000000000000000000000")
+	v6One        = u128{0, 1}
+	v6FfffLow    = u128{0, 0xffff}
+	v6MapMaskAll = hexU128("ffffffffffffffffffffffff00000000")
 )
 
 // maskEq reports (addr & m) == v, the bit-test idiom MRI's predicates use.
-func (ip *IPAddr) maskEq(mHex, vHex string) bool {
-	m := mustHex(mHex)
-	v := mustHex(vHex)
-	return new(big.Int).And(ip.addr, m).Cmp(v) == 0
-}
+func (ip *IPAddr) maskEq(m, v u128) bool { return ip.addr.and(m).cmp(v) == 0 }
 
 // Loopback mirrors IPAddr#loopback?. IPv4 127.0.0.0/8, IPv6 ::1, and the
 // IPv4-mapped 127.0.0.0/8 are loopback.
 func (ip *IPAddr) Loopback() bool {
 	switch ip.family {
 	case AFInet:
-		return ip.maskEq("ff000000", "7f000000")
+		return ip.maskEq(v4LoopMask, v4LoopVal)
 	case AFInet6:
-		return ip.addr.Cmp(big.NewInt(1)) == 0 ||
-			(ip.maskEq("ffff00000000", "ffff00000000") && ip.maskEq("ff000000", "7f000000"))
+		return ip.addr.cmp(v6One) == 0 ||
+			(ip.maskEq(v6MappedMask, v6MappedVal) && ip.maskEq(v4LoopMask, v4LoopVal))
 	default:
 		return false
 	}
@@ -35,14 +55,14 @@ func (ip *IPAddr) Loopback() bool {
 func (ip *IPAddr) Private() bool {
 	switch ip.family {
 	case AFInet:
-		return ip.maskEq("ff000000", "0a000000") ||
-			ip.maskEq("fff00000", "ac100000") ||
-			ip.maskEq("ffff0000", "c0a80000")
+		return ip.maskEq(v4Priv10M, v4Priv10V) ||
+			ip.maskEq(v4Priv172M, v4Priv172V) ||
+			ip.maskEq(v4Priv192M, v4Priv192V)
 	case AFInet6:
-		return ip.maskEq("fe000000000000000000000000000000", "fc000000000000000000000000000000") ||
-			(ip.maskEq("ffff00000000", "ffff00000000") && (ip.maskEq("ff000000", "0a000000") ||
-				ip.maskEq("fff00000", "ac100000") ||
-				ip.maskEq("ffff0000", "c0a80000")))
+		return ip.maskEq(v6UlaMask, v6UlaVal) ||
+			(ip.maskEq(v6MappedMask, v6MappedVal) && (ip.maskEq(v4Priv10M, v4Priv10V) ||
+				ip.maskEq(v4Priv172M, v4Priv172V) ||
+				ip.maskEq(v4Priv192M, v4Priv192V)))
 	default:
 		return false
 	}
@@ -53,10 +73,10 @@ func (ip *IPAddr) Private() bool {
 func (ip *IPAddr) LinkLocal() bool {
 	switch ip.family {
 	case AFInet:
-		return ip.maskEq("ffff0000", "a9fe0000")
+		return ip.maskEq(v4LinkMask, v4LinkVal)
 	case AFInet6:
-		return ip.maskEq("ffc00000000000000000000000000000", "fe800000000000000000000000000000") ||
-			(ip.maskEq("ffff00000000", "ffff00000000") && ip.maskEq("ffff0000", "a9fe0000"))
+		return ip.maskEq(v6LinkMask, v6LinkVal) ||
+			(ip.maskEq(v6MappedMask, v6MappedVal) && ip.maskEq(v4LinkMask, v4LinkVal))
 	default:
 		return false
 	}
@@ -68,27 +88,26 @@ func (ip *IPAddr) LinkLocal() bool {
 func (ip *IPAddr) Multicast() bool {
 	switch ip.family {
 	case AFInet:
-		return ip.maskEq("f0000000", "e0000000")
+		return ip.maskEq(v4McastMask, v4McastVal)
 	case AFInet6:
-		return ip.maskEq("ff000000000000000000000000000000", "ff000000000000000000000000000000")
+		return ip.maskEq(v6McastMask, v6McastVal)
 	default:
 		return false
 	}
 }
 
-// Ipv4Mapped reports whether the address is an IPv4-mapped IPv6 address,
-// mirroring IPAddr#ipv4_mapped?.
+// ipv4MappedQ mirrors IPAddr#ipv4_mapped?.
 func (ip *IPAddr) ipv4MappedQ() bool {
-	return ip.Ipv6() && new(big.Int).Rsh(ip.addr, 32).Cmp(big.NewInt(0xffff)) == 0
+	return ip.Ipv6() && ip.addr.rsh(32).cmp(v6FfffLow) == 0
 }
 
 // ipv4CompatQ mirrors IPAddr#_ipv4_compat?.
 func (ip *IPAddr) ipv4CompatQ() bool {
-	if !ip.Ipv6() || new(big.Int).Rsh(ip.addr, 32).Sign() != 0 {
+	if !ip.Ipv6() || !ip.addr.rsh(32).isZero() {
 		return false
 	}
-	a := new(big.Int).And(ip.addr, in4Mask)
-	return a.Sign() != 0 && a.Cmp(big.NewInt(1)) != 0
+	a := ip.addr.and(mask4)
+	return !a.isZero() && a.cmp(v6One) != 0
 }
 
 // IsIpv4Mapped is the exported predicate for ipv4_mapped?.
@@ -101,13 +120,13 @@ func (ip *IPAddr) IsIpv4Compat() bool { return ip.ipv4CompatQ() }
 // mirroring IPAddr#ipv4_mapped.
 func (ip *IPAddr) Ipv4Mapped() (*IPAddr, error) {
 	if !ip.Ipv4() {
-		return nil, &InvalidAddressError{fmt.Sprintf("not an IPv4 address: %s", ip.addr)}
+		return nil, &InvalidAddressError{"not an IPv4 address: " + ip.addr.big().String()}
 	}
 	c := ip.clone()
-	// The masked value is a valid IPv6 integer by construction, so set cannot
+	// The masked value is a valid IPv6 integer by construction, so setU128 cannot
 	// fail; its error is provably nil here.
-	_ = c.set(new(big.Int).Or(ip.addr, mustHex("ffff00000000")), AFInet6)
-	c.mask = new(big.Int).Or(ip.mask, mustHex("ffffffffffffffffffffffff00000000"))
+	_ = c.setU128(ip.addr.or(v6MappedVal), AFInet6)
+	c.mask = ip.mask.or(v6MapMaskAll)
 	return c, nil
 }
 
@@ -115,12 +134,12 @@ func (ip *IPAddr) Ipv4Mapped() (*IPAddr, error) {
 // address, mirroring IPAddr#ipv4_compat (obsolete in MRI but reproduced).
 func (ip *IPAddr) Ipv4Compat() (*IPAddr, error) {
 	if !ip.Ipv4() {
-		return nil, &InvalidAddressError{fmt.Sprintf("not an IPv4 address: %s", ip.addr)}
+		return nil, &InvalidAddressError{"not an IPv4 address: " + ip.addr.big().String()}
 	}
 	c := ip.clone()
-	// A native IPv4 integer is always a valid IPv6 integer, so set cannot fail.
-	_ = c.set(new(big.Int).Set(ip.addr), AFInet6)
-	c.mask = new(big.Int).Or(ip.mask, mustHex("ffffffffffffffffffffffff00000000"))
+	// A native IPv4 integer is always a valid IPv6 integer, so setU128 cannot fail.
+	_ = c.setU128(ip.addr, AFInet6)
+	c.mask = ip.mask.or(v6MapMaskAll)
 	return c, nil
 }
 
@@ -131,7 +150,7 @@ func (ip *IPAddr) Native() (*IPAddr, error) {
 		return ip, nil
 	}
 	c := ip.clone()
-	return c, c.set(new(big.Int).And(ip.addr, in4Mask), AFInet)
+	return c, c.setU128(ip.addr.and(mask4), AFInet)
 }
 
 // Ntop converts a packed network-byte-ordered address (4 or 16 bytes) to its
@@ -141,13 +160,24 @@ func (ip *IPAddr) Native() (*IPAddr, error) {
 func Ntop(addr []byte) (string, error) {
 	switch len(addr) {
 	case 4:
-		return fmt.Sprintf("%d.%d.%d.%d", addr[0], addr[1], addr[2], addr[3]), nil
+		b := make([]byte, 0, 15)
+		b = appendDec(b, addr[0])
+		b = append(b, '.')
+		b = appendDec(b, addr[1])
+		b = append(b, '.')
+		b = appendDec(b, addr[2])
+		b = append(b, '.')
+		b = appendDec(b, addr[3])
+		return string(b), nil
 	case 16:
-		groups := make([]any, 8)
+		b := make([]byte, 0, 39)
 		for i := 0; i < 8; i++ {
-			groups[i] = uint16(addr[2*i])<<8 | uint16(addr[2*i+1])
+			if i > 0 {
+				b = append(b, ':')
+			}
+			b = appendHex4(b, uint16(addr[2*i])<<8|uint16(addr[2*i+1]))
 		}
-		return fmt.Sprintf("%.4x:%.4x:%.4x:%.4x:%.4x:%.4x:%.4x:%.4x", groups...), nil
+		return string(b), nil
 	default:
 		return "", &AddressFamilyError{"unsupported address family"}
 	}

@@ -8,14 +8,16 @@
 // formatting (to_s / to_string / cidr / inspect), set predicates, bitwise
 // operators and comparison semantics byte-for-byte.
 //
-// The arithmetic is carried in math/big.Int so the 128-bit IPv6 space and MRI's
-// unbounded-integer behaviour (e.g. the succ overflow check that raises
-// "invalid address: 4294967296") are matched exactly, without any dependency on
-// a Ruby runtime.
+// Addresses and netmasks are carried in a fixed-width native-integer
+// representation (see [u128]): IPv4 in 32 bits, IPv6 in 128, with masks,
+// arithmetic and comparisons done in machine words so the common paths never
+// allocate. MRI's unbounded-integer edges — the succ/`+` overflow that raises
+// "invalid address: 4294967296", the packed-integer constructors and #to_i —
+// are handled through a [math/big.Int] bridge used only where arbitrary
+// precision is genuinely required. The representation is endianness-independent.
 package ipaddr
 
 import (
-	"fmt"
 	"math/big"
 	"regexp"
 	"strconv"
@@ -62,34 +64,21 @@ type AddressFamilyError struct{ Msg string }
 
 func (e *AddressFamilyError) Error() string { return e.Msg }
 
-// Masks, matching IPAddr::IN4MASK / IN6MASK.
-var (
-	in4Mask = mustHex("ffffffff")
-	in6Mask = mustHex("ffffffffffffffffffffffffffffffff")
-)
-
-func mustHex(s string) *big.Int {
-	n, ok := new(big.Int).SetString(s, 16)
-	if !ok {
-		panic("ipaddr: bad constant " + s)
-	}
-	return n
-}
-
 var (
 	reIPv4 = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
-	// RE_IPV6ADDRLIKE_FULL: 8 groups, or 6 groups + a dotted-quad tail.
+	// RE_IPV6ADDRLIKE_FULL: 8 groups, or 6 groups + a dotted-quad tail. Retained
+	// for the embedded-IPv4 / dotted-quad fallback that [in6Fast] declines.
 	reIPv6Full = regexp.MustCompile(`(?i)^(?:(?:[\da-f]{1,4}:){7}[\da-f]{1,4}|((?:[\da-f]{1,4}:){6})(\d+)\.(\d+)\.(\d+)\.(\d+))$`)
 	// RE_IPV6ADDRLIKE_COMPRESSED: <left>::<right>, right may end in a dotted quad.
 	reIPv6Comp = regexp.MustCompile(`(?i)^((?:(?:[\da-f]{1,4}:)*[\da-f]{1,4})?)::((?:((?:[\da-f]{1,4}:)*)(?:[\da-f]{1,4}|(\d+)\.(\d+)\.(\d+)\.(\d+)))?)$`)
 )
 
 // IPAddr is a Ruby IPAddr: an address family plus the address and netmask, all
-// carried as big integers exactly as MRI does.
+// carried in the fixed-width native-integer representation [u128].
 type IPAddr struct {
 	family Family
-	addr   *big.Int
-	mask   *big.Int
+	addr   u128
+	mask   u128
 	zoneID string // includes the leading '%', or "" when absent (IPv6 only)
 }
 
@@ -116,19 +105,19 @@ func NewFromInt(addr *big.Int, family Family) (*IPAddr, error) {
 	ip := &IPAddr{}
 	switch family {
 	case AFInet, AFInet6:
-		if err := ip.set(new(big.Int).Set(addr), family); err != nil {
+		if err := ip.setBig(addr, family); err != nil {
 			return nil, err
 		}
 		if family == AFInet {
-			ip.mask = new(big.Int).Set(in4Mask)
+			ip.mask = mask4
 		} else {
-			ip.mask = new(big.Int).Set(in6Mask)
+			ip.mask = mask6
 		}
 		return ip, nil
 	case afUnspec:
 		return nil, &AddressFamilyError{"address family must be specified"}
 	default:
-		return nil, &AddressFamilyError{fmt.Sprintf("unsupported address family: %d", family)}
+		return nil, &AddressFamilyError{"unsupported address family: " + strconv.Itoa(int(family))}
 	}
 }
 
@@ -136,27 +125,30 @@ func newImpl(addr string, family Family) (*IPAddr, error) {
 	ip := &IPAddr{}
 	prefix, prefixlen, hasPrefix := splitPrefix(addr)
 
-	if m := regexp.MustCompile(`(?i)^\[(.*)\]$`).FindStringSubmatch(prefix); m != nil {
-		prefix = m[1]
+	// [ipv6] bracket form: strip and force the IPv6 family.
+	if len(prefix) >= 2 && prefix[0] == '[' && prefix[len(prefix)-1] == ']' {
+		prefix = prefix[1 : len(prefix)-1]
 		family = AFInet6
 	}
-	if m := regexp.MustCompile(`^(.*)(%\w+)$`).FindStringSubmatch(prefix); m != nil {
-		prefix = m[1]
-		ip.zoneID = m[2]
+	// %zone suffix (IPv6 only): the trailing run of word characters after the
+	// last '%', mirroring MRI's /^(.*)(%\w+)$/.
+	if z := zoneSplit(prefix); z >= 0 {
+		ip.zoneID = prefix[z:]
+		prefix = prefix[:z]
 		family = AFInet6
 	}
 
 	if family == afUnspec || family == AFInet {
-		a, err := inAddrChecked(prefix)
+		a, matched, err := inAddrParse(prefix)
 		if err != nil {
 			return nil, err
 		}
-		if a != nil {
-			ip.addr = a
+		if matched {
+			ip.addr = u128{0, uint64(a)}
 			ip.family = AFInet
 		}
 	}
-	if ip.addr == nil && (family == afUnspec || family == AFInet6) {
+	if ip.family != AFInet && (family == afUnspec || family == AFInet6) {
 		a, err := in6Addr(prefix)
 		if err != nil {
 			return nil, err
@@ -172,9 +164,9 @@ func newImpl(addr string, family Family) (*IPAddr, error) {
 			return nil, err
 		}
 	} else if ip.family == AFInet {
-		ip.mask = new(big.Int).Set(in4Mask)
+		ip.mask = mask4
 	} else {
-		ip.mask = new(big.Int).Set(in6Mask)
+		ip.mask = mask6
 	}
 	return ip, nil
 }
@@ -188,83 +180,216 @@ func splitPrefix(s string) (prefix, prefixlen string, has bool) {
 	return s, "", false
 }
 
-// inAddrChecked parses a dotted-quad IPv4 string, mirroring MRI's in_addr. It
-// returns (nil, nil) when the string does not match RE_IPV4ADDRLIKE (so the
-// caller falls through to IPv6), and surfaces MRI's two error conditions for a
-// matched string: an octet >= 256 ("invalid address") and an ambiguous
-// zero-filled octet.
-func inAddrChecked(addr string) (*big.Int, error) {
-	if !reIPv4.MatchString(addr) {
-		return nil, nil
+// zoneSplit returns the byte index where a %zone suffix begins (so s[:z] is the
+// address and s[z:] is "%zone", leading '%' included), or -1 when there is none.
+// It mirrors MRI's /^(.*)(%\w+)$/: the suffix is the last '%' followed by one or
+// more word characters ([0-9A-Za-z_]) running to the end of the string.
+func zoneSplit(s string) int {
+	i := strings.LastIndexByte(s, '%')
+	if i < 0 || i == len(s)-1 {
+		return -1
 	}
-	i := big.NewInt(0)
-	for _, s := range strings.Split(addr, ".") {
-		n, err := strconv.Atoi(s)
-		if err != nil || n >= 256 {
-			return nil, &InvalidAddressError{"invalid address: " + addr}
+	for j := i + 1; j < len(s); j++ {
+		if !isWord(s[j]) {
+			return -1
 		}
-		if s != "0" && strings.HasPrefix(s, "0") {
-			return nil, &InvalidAddressError{"zero-filled number in IPv4 address is ambiguous: " + addr}
-		}
-		i.Lsh(i, 8)
-		i.Or(i, big.NewInt(int64(n)))
 	}
-	return i, nil
+	return i
 }
 
-// in6Addr parses an IPv6 string (with an optional embedded IPv4 tail), mirroring
-// MRI's in6_addr. A non-matching string raises InvalidAddressError; the message
-// uses the (still-nil) @addr, so it renders as "invalid address: ".
-func in6Addr(left string) (*big.Int, error) {
-	var addr *big.Int
+func isWord(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// inAddrParse parses a dotted-quad IPv4 string without regexp or big.Int,
+// mirroring MRI's in_addr. matched is false (with a nil error) when the string
+// is not four dot-separated all-digit fields, so the caller falls through to
+// IPv6; a matched string surfaces MRI's two error conditions in order — an octet
+// >= 256 ("invalid address") then an ambiguous zero-filled octet.
+func inAddrParse(addr string) (val uint32, matched bool, err error) {
+	var acc uint32
+	field, start := 0, 0
+	for i := 0; i <= len(addr); i++ {
+		if i < len(addr) && addr[i] != '.' {
+			continue
+		}
+		seg := addr[start:i]
+		start = i + 1
+		if field == 4 || len(seg) == 0 {
+			return 0, false, nil // not four non-empty fields -> not IPv4-like
+		}
+		n := 0
+		for j := 0; j < len(seg); j++ {
+			c := seg[j]
+			if c < '0' || c > '9' {
+				return 0, false, nil // a non-digit -> not IPv4-like
+			}
+			if len(seg) <= 3 {
+				n = n*10 + int(c-'0')
+			}
+		}
+		// A field of >3 digits is necessarily >= 256; only <=3-digit fields are
+		// value-checked exactly. Message uses the whole address, as MRI does.
+		if len(seg) > 3 || n >= 256 {
+			return 0, false, &InvalidAddressError{"invalid address: " + addr}
+		}
+		if seg != "0" && seg[0] == '0' {
+			return 0, false, &InvalidAddressError{"zero-filled number in IPv4 address is ambiguous: " + addr}
+		}
+		acc = acc<<8 | uint32(n)
+		field++
+	}
+	if field != 4 {
+		return 0, false, nil
+	}
+	return acc, true, nil
+}
+
+// in6Addr parses an IPv6 string into a u128, mirroring MRI's in6_addr. The
+// common colon-hextet forms are handled by the allocation-light [in6Fast]; any
+// form it declines (embedded IPv4, or an input it cannot certify) falls back to
+// the regexp-driven [in6Regex], which reproduces MRI's exact error semantics.
+func in6Addr(left string) (u128, error) {
+	if v, ok := in6Fast(left); ok {
+		return v, nil
+	}
+	return in6Regex(left)
+}
+
+// in6Fast parses the standard colon-separated hextet forms (full 8-group and
+// single "::" compressed) with no regexp and no allocation of a big.Int. It
+// returns ok=false — deferring to the regexp path — for anything it does not
+// certify as valid, including every invalid input and every embedded-IPv4 form,
+// so MRI's error messages and dotted-quad handling are preserved unchanged.
+func in6Fast(s string) (u128, bool) {
+	if strings.IndexByte(s, '.') >= 0 {
+		return u128{}, false // embedded IPv4 -> regexp path
+	}
+	if s == "::" {
+		// The all-zeros form is rare (not on any hot path); route it through the
+		// faithful regexp parser so that non-embedded-compressed path stays
+		// exercised as the safety net for every other compressed input.
+		return u128{}, false
+	}
+	if i := strings.Index(s, "::"); i >= 0 {
+		// Exactly one "::" is allowed, and the right side may not abut a third
+		// colon. (The left side cannot: strings.Index found the first "::", so the
+		// byte before it is never a colon.)
+		rest := s[i+2:]
+		if strings.Contains(rest, "::") || (len(rest) > 0 && rest[0] == ':') {
+			return u128{}, false
+		}
+		lg, lok := parseHextets(s[:i])
+		rg, rok := parseHextets(rest)
+		if !lok || !rok || len(lg)+len(rg) > 7 {
+			// >7 groups leaves no room for the "::" zero run -> invalid; defer.
+			return u128{}, false
+		}
+		var g [8]uint16
+		copy(g[:], lg)
+		copy(g[8-len(rg):], rg)
+		return groupsToU128(g), true
+	}
+	// No "::": must be exactly eight hextets.
+	gs, ok := parseHextets(s)
+	if !ok || len(gs) != 8 {
+		return u128{}, false
+	}
+	var g [8]uint16
+	copy(g[:], gs)
+	return groupsToU128(g), true
+}
+
+// parseHextets splits a colon-separated list of 1-4 digit hex groups. The empty
+// string yields zero groups; any empty or over-long or non-hex group makes it
+// report ok=false.
+func parseHextets(s string) ([]uint16, bool) {
+	if s == "" {
+		return nil, true
+	}
+	out := make([]uint16, 0, 8)
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != ':' {
+			continue
+		}
+		seg := s[start:i]
+		start = i + 1
+		if len(seg) < 1 || len(seg) > 4 {
+			return nil, false
+		}
+		var v uint16
+		for j := 0; j < len(seg); j++ {
+			d := hexVal(seg[j])
+			if d < 0 {
+				return nil, false
+			}
+			v = v<<4 | uint16(d)
+		}
+		out = append(out, v)
+	}
+	return out, true
+}
+
+// groupsToU128 packs eight big-endian hextets into a u128.
+func groupsToU128(g [8]uint16) u128 {
+	hi := uint64(g[0])<<48 | uint64(g[1])<<32 | uint64(g[2])<<16 | uint64(g[3])
+	lo := uint64(g[4])<<48 | uint64(g[5])<<32 | uint64(g[6])<<16 | uint64(g[7])
+	return u128{hi, lo}
+}
+
+// in6Regex is the regexp-driven IPv6 parser, a faithful transcription of MRI's
+// in6_addr including the two embedded-dotted-quad forms and the colon-count
+// guards. A non-matching string raises InvalidAddressError; the message uses the
+// (still-nil) @addr, so it renders as "invalid address: ".
+func in6Regex(left string) (u128, error) {
+	var embedded u128
+	var haveEmbedded bool
 	var right string
 
 	if m := reIPv6Full.FindStringSubmatch(left); m != nil {
 		if m[1] != "" { // 6 groups + dotted quad
-			v, err := inAddrChecked(strings.Join(m[2:6], "."))
+			// The regex already captured four \d+ groups, so inAddrParse always
+			// matches here; only its range/ambiguity error can fire.
+			v, _, err := inAddrParse(strings.Join(m[2:6], "."))
 			if err != nil {
-				return nil, err
+				return u128{}, err
 			}
-			addr = v
+			embedded, haveEmbedded = u128{0, uint64(v)}, true
 			left = m[1] + ":"
-		} else {
-			addr = big.NewInt(0)
 		}
 		right = ""
 	} else if m := reIPv6Comp.FindStringSubmatch(left); m != nil {
 		full := m[0]
 		if m[4] != "" { // compressed with dotted-quad tail
 			if strings.Count(full, ":") > 6 {
-				return nil, &InvalidAddressError{"invalid address: "}
+				return u128{}, &InvalidAddressError{"invalid address: "}
 			}
-			v, err := inAddrChecked(strings.Join(m[4:8], "."))
+			v, _, err := inAddrParse(strings.Join(m[4:8], "."))
 			if err != nil {
-				return nil, err
+				return u128{}, err
 			}
-			addr = v
+			embedded, haveEmbedded = u128{0, uint64(v)}, true
 			left = m[1]
 			right = m[3] + "0:0"
 		} else {
 			limit := 8
-			if m[1] == "" || m[2] == "" {
-				limit = 8
-			} else {
+			if m[1] != "" && m[2] != "" {
 				limit = 7
 			}
 			if strings.Count(full, ":") > limit {
-				return nil, &InvalidAddressError{"invalid address: "}
+				return u128{}, &InvalidAddressError{"invalid address: "}
 			}
 			left = m[1]
 			right = m[2]
-			addr = big.NewInt(0)
 		}
 	} else {
-		return nil, &InvalidAddressError{"invalid address: "}
+		return u128{}, &InvalidAddressError{"invalid address: "}
 	}
 
 	l := splitColons(left)
 	r := splitColons(right)
-	// The colon-count guards above (and the exact-group full-form regex) ensure
+	// The colon-count guards (and the exact-group full-form regex) ensure
 	// len(l)+len(r) never exceeds 8, so rest is non-negative here — MRI keeps a
 	// defensive `return nil if rest < 0`, but it is unreachable once the regex
 	// has matched and the guards have passed.
@@ -276,16 +401,15 @@ func in6Addr(left string) (*big.Int, error) {
 	}
 	groups = append(groups, r...)
 
-	i := big.NewInt(0)
+	var v u128
 	for _, s := range groups {
-		h, _ := strconv.ParseInt(s, 16, 64)
-		i.Lsh(i, 16)
-		i.Or(i, big.NewInt(h))
+		h, _ := strconv.ParseUint(s, 16, 32)
+		v = v.lsh(16).or(u128{0, h})
 	}
-	if addr != nil {
-		i.Or(i, addr)
+	if haveEmbedded {
+		v = v.or(embedded)
 	}
-	return i, nil
+	return v, nil
 }
 
 // splitColons mirrors Ruby's String#split(':') — empty input yields no elements,
@@ -305,57 +429,61 @@ func splitColons(s string) []string {
 	return out
 }
 
-// set assigns @addr (validating range against the family) and, when family is
-// given, switches family and re-clamps an IPv4 mask. Mirrors IPAddr#set.
-func (ip *IPAddr) set(addr *big.Int, family ...Family) error {
+// setU128 assigns @addr (validating range against the family) and, when family
+// is given, switches family and re-clamps an IPv4 mask. Mirrors IPAddr#set.
+func (ip *IPAddr) setU128(addr u128, family ...Family) error {
 	fam := ip.family
 	if len(family) > 0 && family[0] != afUnspec {
 		fam = family[0]
 	}
-	switch fam {
-	case AFInet:
-		if addr.Sign() < 0 || addr.Cmp(in4Mask) > 0 {
-			return &InvalidAddressError{"invalid address: " + addr.String()}
-		}
-	case AFInet6:
-		if addr.Sign() < 0 || addr.Cmp(in6Mask) > 0 {
-			return &InvalidAddressError{"invalid address: " + addr.String()}
-		}
-	default:
+	m, ok := familyMask(fam)
+	if !ok {
 		return &AddressFamilyError{"unsupported address family"}
+	}
+	if addr.cmp(m) > 0 {
+		return &InvalidAddressError{"invalid address: " + addr.big().String()}
 	}
 	ip.addr = addr
 	if len(family) > 0 && family[0] != afUnspec {
 		ip.family = family[0]
-		// MRI clamps an existing IPv4 mask here; when the mask is not yet set
-		// (the new-from-integer path) the caller assigns it immediately after.
-		if ip.family == AFInet && ip.mask != nil {
-			ip.mask = new(big.Int).And(ip.mask, in4Mask)
+		// MRI clamps an existing IPv4 mask here; when the mask has not yet been
+		// assigned it is the zero value and the clamp is a harmless no-op (the
+		// new-from-integer path assigns the real mask immediately after).
+		if ip.family == AFInet {
+			ip.mask = ip.mask.and(mask4)
 		}
 	}
 	return nil
 }
 
+// setBig assigns @addr from a *big.Int, the arbitrary-precision entry used by
+// the integer constructors and coercions. A value that is negative or wider than
+// the family width raises InvalidAddressError with MRI's exact decimal message.
+func (ip *IPAddr) setBig(addr *big.Int, family ...Family) error {
+	v, ok := bigToU128(addr)
+	if !ok {
+		return &InvalidAddressError{"invalid address: " + addr.String()}
+	}
+	return ip.setU128(v, family...)
+}
+
 // clone makes an independent copy, as Ruby's Object#clone does for these ivars.
 func (ip *IPAddr) clone() *IPAddr {
-	return &IPAddr{
-		family: ip.family,
-		addr:   new(big.Int).Set(ip.addr),
-		mask:   new(big.Int).Set(ip.mask),
-		zoneID: ip.zoneID,
-	}
+	c := *ip
+	return &c
 }
 
 // maskBang sets the netmask from a prefix length or netmask string, mirroring
 // IPAddr#mask!.
 func (ip *IPAddr) maskBang(mask string) error {
-	var prefixlen int
+	prefixlen, isPrefix, leadingZero, allDigits := classifyPrefix(mask)
 	switch {
-	case regexp.MustCompile(`^(0|[1-9]+\d*)$`).MatchString(mask):
-		prefixlen, _ = strconv.Atoi(mask)
-	case regexp.MustCompile(`^\d+$`).MatchString(mask):
+	case isPrefix:
+		return ip.maskBangLen(prefixlen)
+	case leadingZero:
 		return &InvalidPrefixError{"leading zeros in prefix"}
 	default:
+		_ = allDigits
 		m, err := New(mask)
 		if err != nil {
 			return err
@@ -369,48 +497,72 @@ func (ip *IPAddr) maskBang(mask string) error {
 		if !isContiguousMask(m.addr, ip.family) {
 			return &InvalidPrefixError{"invalid mask " + mask}
 		}
-		ip.mask = new(big.Int).Set(m.addr)
-		ip.addr.And(ip.addr, ip.mask)
+		ip.mask = m.addr
+		ip.addr = ip.addr.and(ip.mask)
 		return nil
 	}
-	return ip.maskBangLen(prefixlen)
+}
+
+// classifyPrefix categorises a string mask without regexp, mirroring MRI's
+// /\A(0|[1-9]+\d*)\z/ (a prefix length) and /\A\d+\z/ (all-digit with a leading
+// zero -> "leading zeros in prefix") cases; anything else is a netmask string.
+// A prefix length that overflows int is reported large enough to fail the
+// subsequent range check, matching MRI's unbounded to_i.
+func classifyPrefix(mask string) (prefixlen int, isPrefix, leadingZero, allDigits bool) {
+	if mask == "" {
+		return 0, false, false, false
+	}
+	for i := 0; i < len(mask); i++ {
+		if mask[i] < '0' || mask[i] > '9' {
+			return 0, false, false, false
+		}
+	}
+	allDigits = true
+	if mask != "0" && mask[0] == '0' {
+		return 0, false, true, true
+	}
+	n, err := strconv.Atoi(mask)
+	if err != nil {
+		n = 1 << 30 // out-of-range decimal: certainly > 128, fails range check
+	}
+	return n, true, false, true
 }
 
 // maskBangLen applies an integer prefix length, mirroring the Integer branch of
 // IPAddr#mask!.
 func (ip *IPAddr) maskBangLen(prefixlen int) error {
 	var total int
-	var full *big.Int
+	var full u128
 	switch ip.family {
 	case AFInet:
 		if prefixlen < 0 || prefixlen > 32 {
 			return &InvalidPrefixError{"invalid length"}
 		}
-		total, full = 32, in4Mask
+		total, full = 32, mask4
 	case AFInet6:
 		if prefixlen < 0 || prefixlen > 128 {
 			return &InvalidPrefixError{"invalid length"}
 		}
-		total, full = 128, in6Mask
+		total, full = 128, mask6
 	default:
 		return &AddressFamilyError{"unsupported address family"}
 	}
 	masklen := uint(total - prefixlen)
-	ip.mask = new(big.Int).Lsh(new(big.Int).Rsh(full, masklen), masklen)
-	ip.addr = new(big.Int).Lsh(new(big.Int).Rsh(ip.addr, masklen), masklen)
+	ip.mask = full.rsh(masklen).lsh(masklen)
+	ip.addr = ip.addr.rsh(masklen).lsh(masklen)
 	return nil
 }
 
 // isContiguousMask reports whether m is a left-aligned run of 1s within the
 // family's width (a valid netmask), matching MRI's ((n+1)&n).zero? test.
-func isContiguousMask(m *big.Int, family Family) bool {
-	full := in4Mask
-	if family == AFInet6 {
-		full = in6Mask
+func isContiguousMask(m u128, family Family) bool {
+	full, ok := familyMask(family)
+	if !ok {
+		return false
 	}
-	host := new(big.Int).Xor(full, m) // the inverted (host) part
-	plus := new(big.Int).Add(host, big.NewInt(1))
-	return new(big.Int).And(plus, host).Sign() == 0
+	host := full.xor(m) // the inverted (host) part
+	plus, _ := host.addOffset(1)
+	return plus.and(host).isZero()
 }
 
 // Mask returns a new IPAddr built by masking with the given prefix length or
@@ -436,7 +588,7 @@ func (ip *IPAddr) MaskLen(prefixlen int) (*IPAddr, error) {
 func (ip *IPAddr) Family() Family { return ip.family }
 
 // ToI returns the integer representation of the address, mirroring IPAddr#to_i.
-func (ip *IPAddr) ToI() *big.Int { return new(big.Int).Set(ip.addr) }
+func (ip *IPAddr) ToI() *big.Int { return ip.addr.big() }
 
 // Ipv4 reports whether the address is IPv4, mirroring IPAddr#ipv4?.
 func (ip *IPAddr) Ipv4() bool { return ip.family == AFInet }
@@ -446,19 +598,17 @@ func (ip *IPAddr) Ipv6() bool { return ip.family == AFInet6 }
 
 // Prefix returns the prefix length in bits, mirroring IPAddr#prefix.
 func (ip *IPAddr) Prefix() int {
-	var full *big.Int
-	var i int
-	switch ip.family {
-	case AFInet:
-		full, i = in4Mask, 32
-	case AFInet6:
-		full, i = in6Mask, 128
-	default:
+	full, ok := familyMask(ip.family)
+	if !ok {
 		return 0
 	}
-	n := new(big.Int).Xor(full, ip.mask)
-	for n.Sign() > 0 {
-		n.Rsh(n, 1)
+	i := 128
+	if ip.family == AFInet {
+		i = 32
+	}
+	n := full.xor(ip.mask)
+	for !n.isZero() {
+		n = n.rsh(1)
 		i--
 	}
 	return i

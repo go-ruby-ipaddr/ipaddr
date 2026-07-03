@@ -15,14 +15,14 @@ import (
 // `raise AddressFamilyError` guards but are unreachable through the public
 // constructors — are exercised.
 func badFamily() *IPAddr {
-	return &IPAddr{family: Family(99), addr: big.NewInt(1), mask: big.NewInt(1)}
+	return &IPAddr{family: Family(99), addr: u128{0, 1}, mask: u128{0, 1}}
 }
 
 // TestUnsupportedFamilyBranches drives every family switch's default arm.
 func TestUnsupportedFamilyBranches(t *testing.T) {
 	b := badFamily()
 
-	if got := b.toStringRaw(big.NewInt(1)); got != "" {
+	if got := b.toStringRaw(u128{0, 1}); got != "" {
 		t.Errorf("toStringRaw bad family = %q", got)
 	}
 	if got := b.Inspect(); got != "" {
@@ -34,13 +34,13 @@ func TestUnsupportedFamilyBranches(t *testing.T) {
 	if got := b.Prefix(); got != 0 {
 		t.Errorf("Prefix bad family = %d", got)
 	}
-	if _, err := b.addrMask(big.NewInt(1)); !errors.As(err, new(*AddressFamilyError)) {
+	if _, err := b.addrMask(u128{0, 1}); !errors.As(err, new(*AddressFamilyError)) {
 		t.Errorf("addrMask bad family err = %v", err)
 	}
 	if err := b.maskBangLen(0); !errors.As(err, new(*AddressFamilyError)) {
 		t.Errorf("maskBangLen bad family err = %v", err)
 	}
-	if err := b.set(big.NewInt(1)); !errors.As(err, new(*AddressFamilyError)) {
+	if err := b.setU128(u128{0, 1}); !errors.As(err, new(*AddressFamilyError)) {
 		t.Errorf("set bad family err = %v", err)
 	}
 	// endAddr falls back to the IPv4 mask for a non-v6 family; just exercise it.
@@ -60,7 +60,7 @@ func TestNotAndOpsErrorPaths(t *testing.T) {
 	}
 	// Xor with an *IPAddr operand: coerce succeeds, then addrMask hits the
 	// bad-family default arm.
-	gv := &IPAddr{family: AFInet, addr: big.NewInt(1), mask: big.NewInt(1)}
+	gv := &IPAddr{family: AFInet, addr: u128{0, 1}, mask: u128{0, 1}}
 	if _, err := b.Xor(gv); !errors.As(err, new(*AddressFamilyError)) {
 		t.Errorf("Xor bad family err = %v", err)
 	}
@@ -73,7 +73,7 @@ func TestNotAndOpsErrorPaths(t *testing.T) {
 	}
 	// With an *IPAddr operand coerceOther succeeds (no NewFromInt), so the set()
 	// error arm of And/Or/Xor is reached instead.
-	good := &IPAddr{family: AFInet, addr: big.NewInt(1), mask: big.NewInt(1)}
+	good := &IPAddr{family: AFInet, addr: u128{0, 1}, mask: u128{0, 1}}
 	if _, err := b.And(good); err == nil {
 		t.Error("And bad-family set want err")
 	}
@@ -103,7 +103,7 @@ func TestToRangeBadFamily(t *testing.T) {
 // TestEachBadFamily covers the NewFromInt-error return inside Each.
 func TestEachBadFamily(t *testing.T) {
 	// A bad family with lo<=hi so the loop body runs once and NewFromInt fails.
-	b := &IPAddr{family: Family(99), addr: big.NewInt(0), mask: big.NewInt(0)}
+	b := &IPAddr{family: Family(99), addr: u128{}, mask: u128{}}
 	if err := b.Each(func(*IPAddr) error { return nil }); err == nil {
 		t.Error("Each bad family want err")
 	}
@@ -138,14 +138,14 @@ func TestMappedCompatSetErrors(t *testing.T) {
 	}
 }
 
-// TestMustHexPanic covers the panic arm of mustHex.
-func TestMustHexPanic(t *testing.T) {
+// TestHexU128Panic covers the panic arm of hexU128.
+func TestHexU128Panic(t *testing.T) {
 	defer func() {
 		if recover() == nil {
-			t.Error("mustHex(garbage) did not panic")
+			t.Error("hexU128(garbage) did not panic")
 		}
 	}()
-	_ = mustHex("zzzz")
+	_ = hexU128("zzzz")
 }
 
 // TestSplitColonsTrailing exercises the trailing-empty-field trimming and the
@@ -229,7 +229,7 @@ func TestV6Ops(t *testing.T) {
 // TestSetV6OutOfRange covers set()'s IPv6 range-check error arm via an oversize
 // integer.
 func TestSetV6OutOfRange(t *testing.T) {
-	big6 := new(big.Int).Add(in6Mask, big.NewInt(1))
+	big6 := new(big.Int).Lsh(big.NewInt(1), 128) // 2^128, one past IN6MASK
 	if _, err := NewFromInt(big6, AFInet6); !errors.As(err, new(*InvalidAddressError)) {
 		t.Errorf("oversize v6 err = %v", err)
 	}
