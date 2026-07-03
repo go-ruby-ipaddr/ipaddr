@@ -443,7 +443,7 @@ func TestNewFromIntAndFamily(t *testing.T) {
 		t.Errorf("from int bad family err = %v", err)
 	}
 	// out-of-range integer
-	big5 := new(big.Int).Add(in4Mask, big.NewInt(1))
+	big5 := new(big.Int).Lsh(big.NewInt(1), 32) // 2^32, one past IN4MASK
 	if _, err := NewFromInt(big5, AFInet); !errors.As(err, new(*InvalidAddressError)) {
 		t.Errorf("from int oversize err = %v", err)
 	}
